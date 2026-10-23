@@ -1,0 +1,2 @@
+samtools index a.bam
+samtools index 'b c.bam'

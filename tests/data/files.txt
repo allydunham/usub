@@ -1,0 +1,2 @@
+a.bam
+b c.bam

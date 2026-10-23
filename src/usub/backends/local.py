@@ -1,8 +1,9 @@
-"""Local backend: run on this machine, arrays in parallel via ``xargs -P``.
+"""
+Local backend: run on this machine, arrays in parallel via ``xargs -P``.
 
-Single jobs stream their output; array tasks log to ``<logdir>/<name>.<stamp>.<pid>.<index>.out|err``.
-Resource requests other than ``max_parallel`` are ignored. ``max_parallel`` defaults
-to the number of CPUs.
+Single jobs stream their output. Array tasks log to ``<logdir>/<name>.<index>`` and ``.err``
+(one merged file with ``merge_logs``). Resource requests other than ``max_parallel`` are
+ignored; ``max_parallel`` defaults to the number of CPUs.
 """
 
 from __future__ import annotations
@@ -11,95 +12,73 @@ import os
 import shlex
 
 from ..errors import SubmitError, UsubError
-from ..job import INDEX_VAR, Job, Plan
-from .base import _TASKS_DELIM, Backend, Directive, Rendered
-
+from ..job import Job, Plan
+from .base import Backend, Directive, Rendered
 
 class Local(Backend):
+    """Run with ``bash`` on this machine."""
+
     name = "local"
     submit_program = "bash"
+    index_var = "1"  # tasks are run as ``bash -c 'command' _ INDEX``
 
     def directives(self, job: Job, plan: Plan) -> list[Directive]:
+        """
+        No scheduler directives locally
+        """
         return []
 
-    def parallelism(self, job: Job) -> int:
-        return int(job.max_parallel or os.cpu_count() or 1)
-
-    def _check(self, job: Job) -> None:
+    def render_script(self, job: Job, plan: Plan, profile: str | None) -> str:
+        """
+        Bash script running the command, or an array as ``seq | xargs -P`` with a log per task
+        """
         if job.after:
-            raise UsubError("the local backend does not support job dependencies (--after)")
-
-    def render_script(self, job: Job, plan: Plan, manifest_path: str | None,
-                      profile: str | None) -> str:
-        self._check(job)
-        lines = ["#!/bin/bash", self.header_comment(profile), ""]
-        lines += [f"cd {shlex.quote(os.fspath(job.cwd))}", *job.setup]
+            raise UsubError("The local backend does not support job dependencies (--after)")
+        lines = ["#!/bin/bash", self.header_comment(profile), "", f"cd {shlex.quote(os.fspath(job.cwd))}",
+                 *job.setup]
         if not plan.is_array:
-            lines.append(plan.command)
-            return "\n".join(lines) + "\n"
+            return "\n".join(lines + [plan.command]) + "\n"
 
+        log = shlex.quote(os.path.join(job.logdir, job.name))
+        redirect = lambda i: f"exec > {log}.{i} " + ("2>&1" if job.merge_logs else f"2> {log}.{i}.err")
         idx = plan.indices
-        logdir = shlex.quote(os.fspath(job.logdir))
-        lines += [
-            f"usub_logdir={logdir}",
-            f'usub_run="{job.name}.$(date +%Y%m%d-%H%M%S).$$"',
-            'mkdir -p "$usub_logdir"',
-        ]
-        if plan.tasks is not None:
-            if manifest_path:
-                lines.append(f"usub_tasks={shlex.quote(manifest_path)}")
-            else:
-                lines += [
-                    'usub_tasks="$usub_logdir/$usub_run.tasks"',
-                    f"cat >\"$usub_tasks\" <<'{_TASKS_DELIM}'",
-                    *plan.tasks,
-                    _TASKS_DELIM,
-                ]
-            run = 'eval "$(sed -n "${1}p" "$usub_tasks")"'
-        else:
-            lines.append("usub_tasks=")
-            run = plan.command
-        lines += [
-            "usub_task() {",
-            f'  export {INDEX_VAR}="$1"',
-            f"  ( {run}",
-            '  ) >"$usub_logdir/$usub_run.$1.out" 2>"$usub_logdir/$usub_run.$1.err"',
-            "  usub_rc=$?",
-            '  if [ "$usub_rc" -ne 0 ]; then echo "usub: task $1 failed (exit $usub_rc)" >&2; return 1; fi',
-            "}",
-            "export -f usub_task",
-            "export usub_logdir usub_run usub_tasks",
-            f"seq {idx.start} {idx.step} {idx.end} | "
-            f"xargs -P {self.parallelism(job)} -I{{}} bash -c 'usub_task \"$1\"' _ {{}}",
-            "usub_rc=$?",
-            'echo "usub: logs in $usub_logdir/$usub_run.*" >&2',
-            "exit $usub_rc",
-        ]
+        script = f"{redirect('${1}')}; {self.fill_index(plan.command)}"
+        lines += [f"mkdir -p {shlex.quote(os.fspath(job.logdir))}",
+                  f"seq {idx.start} {idx.step} {idx.end} | "
+                  f"xargs -n 1 -P {job.max_parallel or os.cpu_count() or 1} bash -c {shlex.quote(script)} _"]
         return "\n".join(lines) + "\n"
 
     def oneliner(self, rendered: Rendered) -> str:
+        """
+        ``bash -c`` for single jobs, ``seq | xargs -P`` for index arrays (output not redirected)
+        """
         job, plan = rendered.job, rendered.plan
-        self._check(job)
-        if plan.tasks is not None:
-            raise UsubError("one-line form is only available for single jobs and index arrays; "
-                            "use the script form for cmds/files arrays")
-        command = "; ".join([*job.setup, plan.command])
+        if job.after:
+            raise UsubError("The local backend does not support job dependencies (--after)")
+        command = "; ".join([*job.setup, self.fill_index(plan.command) if plan.is_array else plan.command])
         if not plan.is_array:
             return f"bash -c {shlex.quote(command)}"
         idx = plan.indices
-        inner = shlex.quote(f'export {INDEX_VAR}="$1"; {command}')
         return (f"seq {idx.start} {idx.step} {idx.end} | "
-                f"xargs -P {self.parallelism(job)} -I{{}} bash -c {inner} _ {{}}")
+                f"xargs -n 1 -P {job.max_parallel or os.cpu_count() or 1} bash -c {shlex.quote(command)} _")
 
     def submit_hint(self, path: str | None) -> str:
+        """
+        The shell command that runs the script at ``path``
+        """
         return f"bash {path or 'SCRIPT'}"
 
     def submit(self, rendered: Rendered) -> str:
+        """
+        Save the script as ``<name>.script`` and run it in the foreground
+
+        Local jobs have no scheduler id, so the id returned is the process id of the run.
+        """
         import subprocess
 
-        path = rendered.save()
+        rendered.prepare()
+        path = rendered.save(force=True)
         proc = subprocess.Popen(["bash", path])
-        rc = proc.wait()
-        if rc != 0:
-            raise SubmitError(f"local job failed (exit {rc}); script: {path}")
+        if (rc := proc.wait()) != 0:
+            raise SubmitError(f"Local job failed (exit {rc}); script: {path}")
         return str(proc.pid)

@@ -14,8 +14,9 @@ usub = "usub.cli:main"
 dev = ["pytest>=8"]
 
 [build-system]
-requires = ["uv_build>=0.9,<0.13"]
+requires = ["uv_build>=0.9,<0.14"]
 build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["benchmark: end-to-end timing checks (deselect with -m \"not benchmark\")"]

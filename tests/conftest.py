@@ -2,14 +2,13 @@ import pytest
 
 from usub import Config
 
-
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch, tmp_path):
-    """Never read the real user config or USUB_* settings during tests."""
-    for var in ("USUB_PROFILE", "USUB_BACKEND", "USUB_LOGDIR", "USUB_QUEUE", "XDG_CONFIG_HOME"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("USUB_CONFIG", str(tmp_path / "no-config.toml"))
-
+    """Never read the real user or project config during tests."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USUB_CONFIG", str(home / ".usub.toml"))
 
 @pytest.fixture
 def empty_config():
